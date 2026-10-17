@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from collections import Counter
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import regex as re
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
 
 
 def run_linear(
@@ -589,4 +592,185 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    with open(input_path, encoding="utf-8") as file:
+      document =  file.read()
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    ## process special tokens
+    if special_tokens!=[]:
+        special_tokens_pat = "|".join([re.escape(tok) for tok in special_tokens])
+        documents = re.split(special_tokens_pat,document)
+    else:
+        documents = [document]
+
+    ## init vocabulary and pretokenize
+    byte_encoding_list = [bytes([i]) for i in range(256)] + [tok.encode("utf-8") for tok in special_tokens]
+    vocab = {i:byte_encoding_list[i] for i in range(len(byte_encoding_list))}
+    init_vocab_len = len(vocab)
+    running_counter = Counter()
+    for doc in documents:
+        running_counter.update(m.group() for m in re.finditer(PAT, doc))
+    pretok_dict = {tuple(bytes([i]) for i in k.encode("utf-8")):v for k,v in running_counter.items()}
+
+    ## iterate over pretok_dict keys, and for each key iterate over
+    ## consectuive pairs of tokens in ordered tuple
+
+    merges = []
+    tok_pair_freq = {}
+    tok_pair_index = {}
+    for tup in pretok_dict.keys():
+        for i in range(len(tup)-1):
+            if (tup[i],tup[i+1]) in tok_pair_freq:
+                tok_pair_freq[(tup[i],tup[i+1])]+=pretok_dict[tup]
+                if tup not in tok_pair_index[(tup[i],tup[i+1])]:
+                    tok_pair_index[(tup[i],tup[i+1])].append(tup)
+            else:
+                tok_pair_freq[(tup[i],tup[i+1])]=pretok_dict[tup]
+                tok_pair_index[(tup[i],tup[i+1])]=[tup]
+    for i in range(vocab_size-init_vocab_len):
+        if len(tok_pair_freq)==0:
+            break
+        curr_merge_pair = max(tok_pair_freq.items(), key= lambda item: (item[1], item))[0]
+        curr_merge = curr_merge_pair[0]+curr_merge_pair[1]
+        merges.append(curr_merge_pair)
+        curr_vocab_len = len(vocab)
+        vocab[curr_vocab_len]=curr_merge
+        for tup in tok_pair_index[curr_merge_pair].copy():
+            new_tup = []
+            consecutive_flag = False
+            original_indexes = []
+            for i in range(len(tup)):
+                if i<len(tup)-1 and (tup[i],tup[i+1])==curr_merge_pair and not consecutive_flag:
+                    new_tup.append(curr_merge)
+                    original_indexes.append(i)
+                    consecutive_flag= True
+                else:
+                    if consecutive_flag: 
+                        consecutive_flag=False  
+                    else:                 
+                        new_tup.append(tup[i])
+            consecutive_flag = False
+            new_tup = tuple(new_tup)
+            i=0
+            while i<len(tup):
+                if i not in original_indexes and i+1 not in original_indexes:
+                    if i==len(tup)-1:
+                        break
+                    if (tup[i],tup[i+1]) not in tok_pair_index:
+                        tok_pair_index[(tup[i],tup[i+1])] = [new_tup]
+                    else:
+                        if tup in tok_pair_index[(tup[i],tup[i+1])]:
+                            tok_pair_index[(tup[i],tup[i+1])].remove(tup)
+                            tok_pair_index[(tup[i],tup[i+1])].append(new_tup)  
+                        else:
+                            if new_tup not in tok_pair_index[(tup[i],tup[i+1])]:
+                                tok_pair_index[(tup[i],tup[i+1])].append(new_tup)
+                    i+=1
+                    continue
+
+                elif i not in original_indexes and i+1 in original_indexes:
+                    if (tup[i],curr_merge) in tok_pair_freq:
+                        tok_pair_freq[(tup[i],curr_merge)]+=pretok_dict[tup]
+                    else:
+                        tok_pair_freq[(tup[i],curr_merge)]=pretok_dict[tup]
+
+                    if (tup[i],curr_merge) in tok_pair_index:
+                        if new_tup not in tok_pair_index[(tup[i],curr_merge)]:
+                            tok_pair_index[(tup[i],curr_merge)].append(new_tup)
+                    else:
+                        tok_pair_index[(tup[i],curr_merge)] = [new_tup]
+
+                    ## delete for old stuff
+                    if (tup[i],tup[i+1]) in tok_pair_index and tup in tok_pair_index[(tup[i],tup[i+1])]:
+                        tok_pair_index[(tup[i],tup[i+1])].remove(tup)
+                        if tok_pair_index[(tup[i],tup[i+1])]==[]:
+                            del tok_pair_index[(tup[i],tup[i+1])]
+                    tok_pair_freq[(tup[i],tup[i+1])]-=pretok_dict[tup]
+                    if tok_pair_freq[(tup[i],tup[i+1])]<=0:
+                        del tok_pair_freq[(tup[i],tup[i+1])]
+
+                    i+=1
+                    continue
+                    
+
+                elif i in original_indexes:
+                    if i+2>=len(tup):
+                        if (tup[i],tup[i+1]) in tok_pair_freq:
+                            tok_pair_freq[(tup[i],tup[i+1])]-=pretok_dict[tup]
+                        if (tup[i],tup[i+1]) in tok_pair_index and tup in tok_pair_index[(tup[i],tup[i+1])]: 
+                                tok_pair_index[(tup[i],tup[i+1])].remove(tup)
+                        i+=2
+                    
+                    if i+2<len(tup) and i+2 not in original_indexes:
+                        ## update for new stuff
+                        if (curr_merge,tup[i+2]) in tok_pair_freq:
+                            tok_pair_freq[(curr_merge,tup[i+2])]+=pretok_dict[tup]
+                        else:
+                            tok_pair_freq[(curr_merge,tup[i+2])]=pretok_dict[tup]
+
+                        if (curr_merge,tup[i+2]) in tok_pair_index:
+                            if new_tup not in tok_pair_index[(curr_merge,tup[i+2])]:
+                                tok_pair_index[(curr_merge,tup[i+2])].append(new_tup)
+                        else:
+                            tok_pair_index[(curr_merge,tup[i+2])] = [new_tup]
+
+                        ## delete for old stuff
+                        if (tup[i+1],tup[i+2]) in tok_pair_index and tup in tok_pair_index[(tup[i+1],tup[i+2])]:
+                            tok_pair_index[(tup[i+1],tup[i+2])].remove(tup)
+                            if tok_pair_index[(tup[i+1],tup[i+2])]==[]:
+                                del tok_pair_index[(tup[i+1],tup[i+2])]
+                        tok_pair_freq[(tup[i+1],tup[i+2])]-=pretok_dict[tup]
+                        if tok_pair_freq[(tup[i+1],tup[i+2])]<=0:
+                            del tok_pair_freq[(tup[i+1],tup[i+2])]
+                            
+
+                        # if (tup[i],tup[i+1]) in tok_pair_freq:
+                        #     tok_pair_freq[(tup[i],tup[i+1])]-=pretok_dict[tup]
+                        # if (tup[i],tup[i+1]) in tok_pair_index and tup in tok_pair_index[(tup[i],tup[i+1])]: 
+                        #         tok_pair_index[(tup[i],tup[i+1])].remove(tup)
+                        i=i+2
+                        continue
+
+                    if i+2<len(tup) and i+2 in original_indexes:
+                        if (curr_merge,curr_merge) in tok_pair_freq:
+                            tok_pair_freq[(curr_merge,curr_merge)]+=pretok_dict[tup]
+                        else:
+                            tok_pair_freq[(curr_merge,curr_merge)]=pretok_dict[tup]
+
+                        if (curr_merge,curr_merge) in tok_pair_index:
+                            if new_tup not in tok_pair_index[(curr_merge,curr_merge)]:
+                                tok_pair_index[(curr_merge,curr_merge)].append(new_tup)
+                        else:
+                            tok_pair_index[(curr_merge,curr_merge)] = [new_tup]
+
+                        ## delete for old stuff
+                        if (tup[i+1],tup[i+2]) in tok_pair_index and tup in tok_pair_index[(tup[i+1],tup[i+2])]:
+                            tok_pair_index[(tup[i+1],tup[i+2])].remove(tup)
+                            if tok_pair_index[(tup[i+1],tup[i+2])]==[]:
+                                del tok_pair_index[(tup[i+1],tup[i+2])]
+                        tok_pair_freq[(tup[i+1],tup[i+2])]-=pretok_dict[tup]
+                        if tok_pair_freq[(tup[i+1],tup[i+2])]<=0:
+                            del tok_pair_freq[(tup[i+1],tup[i+2])]
+                            
+
+                        # if (tup[i],tup[i+1]) in tok_pair_freq:
+                        #     tok_pair_freq[(tup[i],tup[i+1])]-=pretok_dict[tup]
+                            
+                        
+                        i=i+2
+                        continue      
+
+            
+            pretok_dict[new_tup] = pretok_dict[tup]
+            del pretok_dict[tup]      
+        if curr_merge_pair in tok_pair_freq:
+            del tok_pair_freq[curr_merge_pair]
+        if curr_merge_pair in tok_pair_index:
+            del tok_pair_index[curr_merge_pair]
+        
+    return (vocab,merges)
+
+
+    
+
+
