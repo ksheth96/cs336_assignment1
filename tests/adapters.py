@@ -11,7 +11,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from cs336_basics.model import Embedding, Linear, RMSNorm
+from cs336_basics.model import Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU
 from cs336_basics.tokenizer import BPETokenizer
 
 
@@ -96,7 +96,9 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu_module = SwiGLU(d_model=d_model,d_ff=d_ff,device=w1_weight.device,dtype=w1_weight.dtype)
+    swiglu_module.load_state_dict(state_dict={"W_1":w1_weight.transpose(-2,-1),"W_2":w2_weight.transpose(-2,-1),"W_3":w3_weight.transpose(-2,-1)},strict=True)
+    return swiglu_module(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -213,7 +215,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope_module = RotaryPositionalEmbedding(d_k=d_k,theta=theta,max_seq_len=max_seq_len,device=in_query_or_key.device)
+    return rope_module(in_query_or_key,token_positions)
 
 
 def run_transformer_block(
