@@ -3,6 +3,8 @@ import torch
 from torch import nn
 import math
 
+from cs336_basics.utils import scaled_dot_product_attention
+
 class Linear(nn.Module):
     """Bias-free linear module with the assignment's recommended interface."""
 
@@ -135,3 +137,73 @@ class RotaryPositionalEmbedding(nn.Module):
         output[...,0:x.shape[-1]-1:2] = cos_rotations*x_even-sin_rotations*x_odd
         output[...,1:x.shape[-1]:2] = cos_rotations*x_odd+sin_rotations*x_even
         return output
+
+
+class MultiHeadSelfAttention(nn.Module):
+    """Causal multi-head self-attention from Section 3.4.5 of the assignment.
+
+    The per-head dimensions satisfy d_k = d_v = d_model / num_heads.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        rope: RotaryPositionalEmbedding | None = None,
+    ) -> None:
+        """Initialize the module.
+
+        Args:
+            d_model: Input and output width; must be divisible by num_heads.
+            num_heads: Number of attention heads.
+            device: Device for the module's parameters.
+            dtype: Data type for the module's parameters.
+            rope: Optional preconfigured rotary positional embedding module.
+        """
+        super().__init__()
+        sigma = math.sqrt(1/d_model)
+        W_init = nn.init.trunc_normal_(torch.empty(size=(3*d_model,d_model),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
+        W_O_init = nn.init.trunc_normal_(torch.empty(size=(d_model,d_model),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
+        self.W = nn.Parameter(W_init)
+        self.W_O = nn.Parameter(W_O_init)
+        self.d_k = int(d_model/num_heads)
+        self.num_heads = num_heads
+        if rope is not None:
+            self.rope = rope
+        else:
+            self.rope = None
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply causal self-attention, preventing access to future positions.
+
+        Args:
+            x: Input tensor with shape (..., sequence_length, d_model).
+            token_positions: Optional integer positions with shape
+                (..., sequence_length), for use with RoPE.
+
+        Returns:
+            Output tensor with shape (..., sequence_length, d_model).
+        """
+        seq_len = x.shape[-2]
+        if token_positions is None:
+            token_positions = torch.arange(0,seq_len,1)
+        if self.rope is None:
+            self.rope = lambda x,y : x
+        x_proj = torch.einsum('...d,o d -> ...o',x, self.W).reshape(shape=x.shape[:-2]+(seq_len,self.num_heads,3*self.d_k)).transpose(-3,-2)
+        causal_mask = torch.tril(torch.ones(size=(seq_len,seq_len),device=x.device)).bool()
+        multi_head_attn = scaled_dot_product_attention(self.rope(x_proj[...,:self.d_k],token_positions.unsqueeze(-2)),self.rope(x_proj[...,self.d_k:2*self.d_k],token_positions.unsqueeze(-2)),x_proj[...,2*self.d_k:3*self.d_k],causal_mask).transpose(-3,-2).reshape(shape=x.shape)
+        return torch.einsum('...s d, o d -> ... s o',multi_head_attn, self.W_O)
+
+
+
+
+
+
+

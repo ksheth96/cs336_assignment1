@@ -11,8 +11,9 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from cs336_basics.model import Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU
+from cs336_basics.model import Embedding, Linear, MultiHeadSelfAttention, RMSNorm, RotaryPositionalEmbedding, SwiGLU
 from cs336_basics.tokenizer import BPETokenizer
+from cs336_basics.utils import scaled_dot_product_attention, softmax
 
 
 
@@ -119,7 +120,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q,K,V,mask)
 
 
 def run_multihead_self_attention(
@@ -153,7 +154,23 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attention = MultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    d_k = d_model // num_heads
+    # Match the module's per-head row order: Q_1, K_1, V_1, Q_2, K_2, V_2, ...
+    packed_qkv = torch.cat(
+        [
+            weight.reshape(num_heads, d_k, d_model)
+            for weight in (q_proj_weight, k_proj_weight, v_proj_weight)
+        ],
+        dim=1,
+    ).reshape(3 * d_model, d_model)
+    attention.load_state_dict({"W": packed_qkv, "W_O": o_proj_weight})
+    return attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -193,7 +210,30 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    d_k = d_model // num_heads
+    rope = RotaryPositionalEmbedding(
+        theta=theta,
+        d_k=d_k,
+        max_seq_len=max_seq_len,
+        device=in_features.device,
+    )
+    attention = MultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=in_features.device,
+        dtype=in_features.dtype,
+        rope=rope,
+    )
+    # Match the module's per-head row order: Q_1, K_1, V_1, Q_2, K_2, V_2, ...
+    packed_qkv = torch.cat(
+        [
+            weight.reshape(num_heads, d_k, d_model)
+            for weight in (q_proj_weight, k_proj_weight, v_proj_weight)
+        ],
+        dim=1,
+    ).reshape(3 * d_model, d_model)
+    attention.load_state_dict({"W": packed_qkv, "W_O": o_proj_weight})
+    return attention(in_features, token_positions=token_positions)
 
 
 def run_rope(
@@ -450,7 +490,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features,dim)
 
 
 def run_cross_entropy(
