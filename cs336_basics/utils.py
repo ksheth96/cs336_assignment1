@@ -30,5 +30,21 @@ def scaled_dot_product_attention(
         mask = torch.ones(size=qk.shape).bool()
     
     return softmax(x=qk.masked_fill_(mask=~mask,value=-torch.inf), i=-1) @ v    
+
+
+def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Compute numerically stable mean cross-entropy from unnormalized logits.
+
+    Args:
+        inputs: Floating-point logits with shape (..., vocab_size).
+        targets: Integer class IDs with shape matching the leading dimensions
+            of inputs. Each ID must be between 0 and vocab_size - 1.
+
+    Returns:
+        A scalar tensor containing the loss averaged across all batch-like
+        dimensions.
+    """
+    max_logits = torch.max(inputs,dim=-1,keepdim=True).values
+    return torch.mean(max_logits - torch.gather(inputs,dim=-1,index=targets.unsqueeze(-1)) + torch.log(torch.sum(torch.exp(inputs-max_logits),dim=-1,keepdim=True)))
     
 

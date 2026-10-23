@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import math
 
-from cs336_basics.utils import scaled_dot_product_attention
+from cs336_basics.utils import scaled_dot_product_attention, softmax
 
 class Linear(nn.Module):
     """Bias-free linear module with the assignment's recommended interface."""
@@ -60,7 +60,7 @@ class RMSNorm(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        self.gain = torch.ones(size=(d_model,),dtype=dtype,device=device)
+        self.gain = nn.Parameter(data=torch.ones(size=(d_model,),dtype=dtype,device=device))
         self.eps=eps
         
 
@@ -195,10 +195,125 @@ class MultiHeadSelfAttention(nn.Module):
             token_positions = torch.arange(0,seq_len,1)
         if self.rope is None:
             self.rope = lambda x,y : x
-        x_proj = torch.einsum('...d,o d -> ...o',x, self.W).reshape(shape=x.shape[:-2]+(seq_len,self.num_heads,3*self.d_k)).transpose(-3,-2)
+        x_proj = torch.einsum('...d,o d -> ...o',x, self.W)
+        q, k, v = (
+            proj.reshape(shape=x.shape[:-2]+(seq_len,self.num_heads,self.d_k)).transpose(-3,-2)
+            for proj in x_proj.chunk(3, dim=-1)
+        )
         causal_mask = torch.tril(torch.ones(size=(seq_len,seq_len),device=x.device)).bool()
-        multi_head_attn = scaled_dot_product_attention(self.rope(x_proj[...,:self.d_k],token_positions.unsqueeze(-2)),self.rope(x_proj[...,self.d_k:2*self.d_k],token_positions.unsqueeze(-2)),x_proj[...,2*self.d_k:3*self.d_k],causal_mask).transpose(-3,-2).reshape(shape=x.shape)
+        multi_head_attn = scaled_dot_product_attention(self.rope(q,token_positions.unsqueeze(-2)),self.rope(k,token_positions.unsqueeze(-2)),v,causal_mask).transpose(-3,-2).reshape(shape=x.shape)
         return torch.einsum('...s d, o d -> ... s o',multi_head_attn, self.W_O)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm Transformer block from Section 3.5 of the assignment."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        rope: RotaryPositionalEmbedding | None = None,
+    ) -> None:
+        """Initialize the block.
+
+        Args:
+            d_model: Input and output width.
+            num_heads: Number of self-attention heads.
+            d_ff: Inner width of the SwiGLU feed-forward network.
+            device: Device for the block's parameters.
+            dtype: Data type for the block's parameters.
+            rope: Optional preconfigured RoPE module, which can be shared
+                across blocks.
+        """
+        super().__init__()
+        self.d_k = d_model/num_heads
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rms_norm_attn = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.multi_head_attn = MultiHeadSelfAttention(d_model=d_model,num_heads=num_heads,device=device,dtype=dtype, rope=rope)
+        self.rms_norm_ffn = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.ffn = SwiGLU(d_model=d_model,d_ff=d_ff,device=device,dtype=dtype)
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Process a sequence while preserving its shape.
+
+        Args:
+            x: Input tensor with shape (..., sequence_length, d_model).
+            token_positions: Optional integer positions with shape
+                (..., sequence_length), for use with RoPE.
+
+        Returns:
+            Output tensor with shape (..., sequence_length, d_model).
+        """
+        y = x + self.multi_head_attn(self.rms_norm_attn(x),token_positions)
+        return y+self.ffn(self.rms_norm_ffn(y))
+
+
+class TransformerLM(nn.Module):
+    """Transformer language model from Section 3.5 of the assignment."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Initialize the language model.
+
+        Args:
+            vocab_size: Number of tokens in the vocabulary.
+            context_length: Maximum supported sequence length.
+            d_model: Embedding and Transformer block width.
+            num_layers: Number of Transformer blocks.
+            num_heads: Number of attention heads per block.
+            d_ff: Inner width of each SwiGLU feed-forward network.
+            rope_theta: RoPE frequency base.
+            device: Device for the model's parameters and buffers.
+            dtype: Data type for the model's parameters.
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        rope = RotaryPositionalEmbedding(theta=rope_theta,d_k=d_model/num_heads,max_seq_len=context_length,device=device)
+        self.token_embedding = Embedding(num_embeddings=vocab_size,embedding_dim=d_model,device=device,dtype=dtype)
+        self.transformer_layers = nn.ModuleList([TransformerBlock(d_model=d_model,num_heads=num_heads,d_ff=d_ff,device=device,dtype=dtype,rope=rope) for i in range(num_layers)])
+        self.output_rmsnorm = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.output_proj = Linear(in_features=d_model,out_features=vocab_size,device=device,dtype=dtype)
+
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return unnormalized next-token logits for each input position.
+
+        Args:
+            token_ids: Integer token IDs with shape (..., sequence_length).
+                The sequence length must not exceed context_length.
+            token_positions: Optional integer positions with shape
+                (..., sequence_length), for use with RoPE.
+
+        Returns:
+            Logits with shape (..., sequence_length, vocab_size).
+        """
+        x = self.token_embedding(token_ids=token_ids)
+        for i in range(self.num_layers):
+            x = self.transformer_layers[i](x,token_positions)
+        return self.output_proj(self.output_rmsnorm(x))
 
 
 
