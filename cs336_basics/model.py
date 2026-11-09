@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import math
 
-from cs336_basics.utils import scaled_dot_product_attention, softmax
+from cs336_basics.utils import scaled_dot_product_attention, silu
 
 class Linear(nn.Module):
     """Bias-free linear module with the assignment's recommended interface."""
@@ -17,17 +17,17 @@ class Linear(nn.Module):
         super().__init__()
         sigma = math.sqrt(2/(in_features+out_features))
         W_init = nn.init.trunc_normal_(torch.empty(size=(out_features,in_features),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        self.W = nn.Parameter(data=W_init)
+        self.weight = nn.Parameter(data=W_init)
         
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-1]!=self.W.shape[-1]:
+        if x.shape[-1]!=self.weight.shape[-1]:
             raise ValueError("feature tensor does not have the correct shape")
-        if x.device!=self.W.device:
+        if x.device!=self.weight.device:
             raise ValueError("feature tensor not on the same device as linear layer params")
-        if x.dtype!=self.W.dtype:
+        if x.dtype!=self.weight.dtype:
             raise ValueError("feature tensor dtype mismatch with linear layer parameter dtype")
-        return torch.einsum('...i, oi -> ...o',x,self.W)
+        return torch.einsum('...i, oi -> ...o',x,self.weight)
 
 
 class Embedding(nn.Module):
@@ -42,11 +42,11 @@ class Embedding(nn.Module):
     ) -> None:
         super().__init__()
         W_init = torch.nn.init.trunc_normal_(torch.empty(size=(num_embeddings,embedding_dim),device=device,dtype=dtype),mean=0,std=1,a=-3,b=3)
-        self.W_embd = nn.Parameter(data=W_init)
+        self.weight = nn.Parameter(data=W_init)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         
-        return self.W_embd[token_ids]
+        return self.weight[token_ids]
 
 
 class RMSNorm(nn.Module):
@@ -60,7 +60,7 @@ class RMSNorm(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        self.gain = nn.Parameter(data=torch.ones(size=(d_model,),dtype=dtype,device=device))
+        self.weight = nn.Parameter(data=torch.ones(size=(d_model,),dtype=dtype,device=device))
         self.eps=eps
         
 
@@ -68,7 +68,7 @@ class RMSNorm(nn.Module):
         in_dtype=x.dtype
         x=x.to(dtype=torch.float32)
         x_norm =torch.sqrt(torch.mean(torch.square(x),dim=-1,keepdim=True)+self.eps)
-        result = (x/x_norm)*self.gain
+        result = (x/x_norm)*self.weight
         return result.to(dtype=in_dtype)
         
 
@@ -86,20 +86,16 @@ class SwiGLU(nn.Module):
         super().__init__()
         if d_ff is None:
             d_ff = math.ceil(8*d_model/192)*64
-        sigma = math.sqrt(2/(d_model+d_ff))
-        W_1_init = nn.init.trunc_normal_(torch.empty(size=(d_model,d_ff),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        W_2_init = nn.init.trunc_normal_(torch.empty(size=(d_ff,d_model),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        W_3_init = nn.init.trunc_normal_(torch.empty(size=(d_model,d_ff),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        self.W_1 = nn.Parameter(data=W_1_init)
-        self.W_2 = nn.Parameter(data=W_2_init)
-        self.W_3 = nn.Parameter(data=W_3_init)
+        self.w1 = Linear(in_features=d_model,out_features=d_ff,device=device,dtype=dtype)
+        self.w2 = Linear(in_features=d_ff,out_features=d_model,device=device,dtype=dtype)
+        self.w3 = Linear(in_features=d_model,out_features=d_ff,device=device,dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape (...,d_model), most likely (batch_size,seq_len,d_model)
         # first, silu x
-        w1_x = torch.einsum('...i, io -> ...o',x,self.W_1)
-        w3_x = torch.einsum('...i, io -> ...o',x,self.W_3)
-        return torch.einsum('...o, oi -> ...i', torch.sigmoid(w1_x) * w1_x * w3_x, self.W_2)
+        w1_x = self.w1(x)
+        w3_x = self.w3(x)
+        return self.w2(silu(w1_x) * w3_x)
         
 
 
@@ -164,9 +160,8 @@ class MultiHeadSelfAttention(nn.Module):
         super().__init__()
         sigma = math.sqrt(1/d_model)
         W_init = nn.init.trunc_normal_(torch.empty(size=(3*d_model,d_model),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        W_O_init = nn.init.trunc_normal_(torch.empty(size=(d_model,d_model),device=device,dtype=dtype),mean=0,std=sigma,a=-3*sigma,b=3*sigma)
-        self.W = nn.Parameter(W_init)
-        self.W_O = nn.Parameter(W_O_init)
+        self.qkv_weight = nn.Parameter(W_init)
+        self.output_proj = Linear(in_features=d_model,out_features=d_model,device=device,dtype=dtype)
         self.d_k = int(d_model/num_heads)
         self.num_heads = num_heads
         if rope is not None:
@@ -195,14 +190,14 @@ class MultiHeadSelfAttention(nn.Module):
             token_positions = torch.arange(0,seq_len,1)
         if self.rope is None:
             self.rope = lambda x,y : x
-        x_proj = torch.einsum('...d,o d -> ...o',x, self.W)
+        x_proj = torch.einsum('...d,o d -> ...o',x, self.qkv_weight)
         q, k, v = (
             proj.reshape(shape=x.shape[:-2]+(seq_len,self.num_heads,self.d_k)).transpose(-3,-2)
             for proj in x_proj.chunk(3, dim=-1)
         )
         causal_mask = torch.tril(torch.ones(size=(seq_len,seq_len),device=x.device)).bool()
         multi_head_attn = scaled_dot_product_attention(self.rope(q,token_positions.unsqueeze(-2)),self.rope(k,token_positions.unsqueeze(-2)),v,causal_mask).transpose(-3,-2).reshape(shape=x.shape)
-        return torch.einsum('...s d, o d -> ... s o',multi_head_attn, self.W_O)
+        return self.output_proj(multi_head_attn)
 
 
 class TransformerBlock(nn.Module):
@@ -232,9 +227,9 @@ class TransformerBlock(nn.Module):
         self.d_k = d_model/num_heads
         self.num_heads = num_heads
         self.d_ff = d_ff
-        self.rms_norm_attn = RMSNorm(d_model=d_model,device=device,dtype=dtype)
-        self.multi_head_attn = MultiHeadSelfAttention(d_model=d_model,num_heads=num_heads,device=device,dtype=dtype, rope=rope)
-        self.rms_norm_ffn = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.ln1 = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.attn = MultiHeadSelfAttention(d_model=d_model,num_heads=num_heads,device=device,dtype=dtype, rope=rope)
+        self.ln2 = RMSNorm(d_model=d_model,device=device,dtype=dtype)
         self.ffn = SwiGLU(d_model=d_model,d_ff=d_ff,device=device,dtype=dtype)
 
 
@@ -253,8 +248,8 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor with shape (..., sequence_length, d_model).
         """
-        y = x + self.multi_head_attn(self.rms_norm_attn(x),token_positions)
-        return y+self.ffn(self.rms_norm_ffn(y))
+        y = x + self.attn(self.ln1(x),token_positions)
+        return y+self.ffn(self.ln2(y))
 
 
 class TransformerLM(nn.Module):
@@ -288,10 +283,10 @@ class TransformerLM(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         rope = RotaryPositionalEmbedding(theta=rope_theta,d_k=d_model/num_heads,max_seq_len=context_length,device=device)
-        self.token_embedding = Embedding(num_embeddings=vocab_size,embedding_dim=d_model,device=device,dtype=dtype)
-        self.transformer_layers = nn.ModuleList([TransformerBlock(d_model=d_model,num_heads=num_heads,d_ff=d_ff,device=device,dtype=dtype,rope=rope) for i in range(num_layers)])
-        self.output_rmsnorm = RMSNorm(d_model=d_model,device=device,dtype=dtype)
-        self.output_proj = Linear(in_features=d_model,out_features=vocab_size,device=device,dtype=dtype)
+        self.token_embeddings = Embedding(num_embeddings=vocab_size,embedding_dim=d_model,device=device,dtype=dtype)
+        self.layers = nn.ModuleList([TransformerBlock(d_model=d_model,num_heads=num_heads,d_ff=d_ff,device=device,dtype=dtype,rope=rope) for i in range(num_layers)])
+        self.ln_final = RMSNorm(d_model=d_model,device=device,dtype=dtype)
+        self.lm_head = Linear(in_features=d_model,out_features=vocab_size,device=device,dtype=dtype)
 
 
     def forward(
@@ -310,10 +305,10 @@ class TransformerLM(nn.Module):
         Returns:
             Logits with shape (..., sequence_length, vocab_size).
         """
-        x = self.token_embedding(token_ids=token_ids)
+        x = self.token_embeddings(token_ids=token_ids)
         for i in range(self.num_layers):
-            x = self.transformer_layers[i](x,token_positions)
-        return self.output_proj(self.output_rmsnorm(x))
+            x = self.layers[i](x,token_positions)
+        return self.lm_head(self.ln_final(x))
 
 
 

@@ -8,3 +8,6 @@ a. UTF-16 and UTF-32 inject frequent null bytes (00) for standard ASCII text. If
 b. function wrong as utf-8 is not a per unicode character mapping, its a variable length encoding.
 c. bytes([200,200]) fails as first is start byte and second is not a continuation byte and a start byte as well for a multibyte char.
 
+## Problem (learning_rate_tuning):
+loss decreases until lr 100 then at lr 1000 loss blows up.
+

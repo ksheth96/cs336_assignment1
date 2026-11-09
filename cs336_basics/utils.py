@@ -6,6 +6,8 @@ def softmax(x: torch.tensor, i: int) -> torch.tensor:
     x_exp = torch.exp(x - torch.max(input=x,dim=i,keepdim=True).values)
     return x_exp/torch.sum(x_exp,dim=i,keepdim=True)
 
+def silu(x: torch.tensor) -> torch.tensor:
+    return torch.sigmoid(x) * x
 
 def scaled_dot_product_attention(
     q: torch.Tensor,

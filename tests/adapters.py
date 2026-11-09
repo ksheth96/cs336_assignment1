@@ -10,10 +10,24 @@ import regex as re
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from cs336_basics.optimizers import AdamW
 
 from cs336_basics.model import Embedding, Linear, MultiHeadSelfAttention, RMSNorm, RotaryPositionalEmbedding, SwiGLU, TransformerBlock, TransformerLM
 from cs336_basics.tokenizer import BPETokenizer
-from cs336_basics.utils import cross_entropy, scaled_dot_product_attention, softmax
+from cs336_basics.utils import cross_entropy, scaled_dot_product_attention, silu, softmax
+
+
+def _pack_qkv_weights(weights: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Convert separate assignment Q/K/V weights to the module's packed layout."""
+    packed_weights = weights.copy()
+    for key in weights:
+        if key.endswith("q_proj.weight"):
+            prefix = key.removesuffix("q_proj.weight")
+            packed_weights[f"{prefix}qkv_weight"] = torch.cat(
+                [packed_weights.pop(f"{prefix}{proj}_proj.weight") for proj in ("q", "k", "v")],
+                dim=0,
+            )
+    return packed_weights
 
 
 
@@ -39,7 +53,7 @@ def run_linear(
     assert weights.device==in_features.device
     linear_layer = Linear(in_features=d_in,out_features=d_out,device=weights.device,dtype=weights.dtype)
     with torch.no_grad():
-        linear_layer.W.copy_(weights)
+        linear_layer.weight.copy_(weights)
     return linear_layer(in_features)
 
 
@@ -64,7 +78,7 @@ def run_embedding(
 
     embedding_layer = Embedding(num_embeddings=vocab_size,embedding_dim=d_model,device=weights.device, dtype=weights.dtype)
     with torch.no_grad():
-        embedding_layer.W_embd.copy_(weights)
+        embedding_layer.weight.copy_(weights)
     return embedding_layer(token_ids)
 
 
@@ -98,7 +112,7 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
     swiglu_module = SwiGLU(d_model=d_model,d_ff=d_ff,device=w1_weight.device,dtype=w1_weight.dtype)
-    swiglu_module.load_state_dict(state_dict={"W_1":w1_weight.transpose(-2,-1),"W_2":w2_weight.transpose(-2,-1),"W_3":w3_weight.transpose(-2,-1)},strict=True)
+    swiglu_module.load_state_dict({"w1.weight":w1_weight,"w2.weight":w2_weight,"w3.weight":w3_weight})
     return swiglu_module(in_features)
 
 
@@ -160,9 +174,12 @@ def run_multihead_self_attention(
         device=in_features.device,
         dtype=in_features.dtype,
     )
-    # Match the module's row order: all Q, then all K, then all V.
-    packed_qkv = torch.cat((q_proj_weight, k_proj_weight, v_proj_weight), dim=0)
-    attention.load_state_dict({"W": packed_qkv, "W_O": o_proj_weight})
+    attention.load_state_dict(_pack_qkv_weights({
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    }))
     return attention(in_features)
 
 
@@ -217,9 +234,12 @@ def run_multihead_self_attention_with_rope(
         dtype=in_features.dtype,
         rope=rope,
     )
-    # Match the module's row order: all Q, then all K, then all V.
-    packed_qkv = torch.cat((q_proj_weight, k_proj_weight, v_proj_weight), dim=0)
-    attention.load_state_dict({"W": packed_qkv, "W_O": o_proj_weight})
+    attention.load_state_dict(_pack_qkv_weights({
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    }))
     return attention(in_features, token_positions=token_positions)
 
 
@@ -318,10 +338,7 @@ def run_transformer_block(
     """
     rope = RotaryPositionalEmbedding(theta=theta,d_k=d_model/num_heads,max_seq_len=max_seq_len,device=in_features.device)
     transformer_block = TransformerBlock(d_model=d_model,num_heads=num_heads,d_ff=d_ff,device=in_features.device,dtype=in_features.dtype,rope=rope)
-    transformer_block.multi_head_attn.load_state_dict({"W_O":weights["attn.output_proj.weight"],"W":torch.concat([weights["attn.q_proj.weight"],weights["attn.k_proj.weight"],weights["attn.v_proj.weight"]],dim=-2)})
-    transformer_block.rms_norm_attn.load_state_dict({"gain":weights["ln1.weight"]})
-    transformer_block.rms_norm_ffn.load_state_dict({"gain":weights["ln2.weight"]})
-    transformer_block.ffn.load_state_dict({"W_1":weights["ffn.w1.weight"].transpose(-2,-1),"W_2":weights["ffn.w2.weight"].transpose(-2,-1),"W_3":weights["ffn.w3.weight"].transpose(-2,-1)})
+    transformer_block.load_state_dict(_pack_qkv_weights(weights))
     return transformer_block(in_features)
 
 
@@ -415,27 +432,7 @@ def run_transformer_lm(
         device=in_indices.device,
         dtype=weights["token_embeddings.weight"].dtype,
     )
-    mapped_weights = {
-        "token_embedding.W_embd": weights["token_embeddings.weight"],
-        "output_rmsnorm.gain": weights["ln_final.weight"],
-        "output_proj.W": weights["lm_head.weight"],
-    }
-    for i in range(num_layers):
-        source = f"layers.{i}"
-        target = f"transformer_layers.{i}"
-        mapped_weights.update({
-            f"{target}.multi_head_attn.W": torch.cat(
-                [weights[f"{source}.attn.{proj}_proj.weight"] for proj in ("q", "k", "v")],
-                dim=0,
-            ),
-            f"{target}.multi_head_attn.W_O": weights[f"{source}.attn.output_proj.weight"],
-            f"{target}.rms_norm_attn.gain": weights[f"{source}.ln1.weight"],
-            f"{target}.rms_norm_ffn.gain": weights[f"{source}.ln2.weight"],
-        })
-        # SwiGLU stores each matrix in the opposite orientation to the reference.
-        for j in (1, 2, 3):
-            mapped_weights[f"{target}.ffn.W_{j}"] = weights[f"{source}.ffn.w{j}.weight"].transpose(-2, -1)
-    model.load_state_dict(mapped_weights)
+    model.load_state_dict(_pack_qkv_weights(weights))
     return model(in_indices)
 
 
@@ -461,7 +458,7 @@ def run_rmsnorm(
     """
     rmsnorm_layer = RMSNorm(d_model=d_model,eps=eps,device=weights.device,dtype=weights.dtype)
     with torch.no_grad():
-        rmsnorm_layer.gain.copy_(weights)
+        rmsnorm_layer.weight.copy_(weights)
     return rmsnorm_layer(in_features)
 
 
@@ -476,7 +473,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return silu(in_features)
 
 
 def run_get_batch(
@@ -552,7 +549,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
